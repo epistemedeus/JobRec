@@ -9,8 +9,10 @@ Pruning works in two steps so that it never deletes on a guess:
 2. Confirm. Each candidate's application link is followed (see link_check.py).
    A Greenhouse listing whose company matches exactly one configured board is
    confirmed through that board's per-job API instead (see greenhouse_status.py).
-   Only a listing whose check positively shows it is closed is removed. A failed
-   or blocked request, or an unverified board, leaves the listing in place and is logged.
+   A Greenhouse listing with no single configured board is unknown and its page
+   is not requested. Only a listing whose check positively shows it is closed is
+   removed. A failed or blocked request, or an unverified board, leaves the
+   listing in place and is logged.
 
 Being absent from a scrape is never enough on its own: some scrapers fetch only
 part of a large board, so an absent listing may well still be open.

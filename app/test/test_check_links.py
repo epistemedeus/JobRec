@@ -17,7 +17,8 @@ from link_fakes import FakeSession, json_page, page  # noqa: E402
 
 
 def make_listing(job_id: str, title: str = "Software Engineer", company: str = "Acme") -> JobListing:
-    return JobListing(title=title, company_name=company, source="greenhouse",
+    # Not greenhouse: an unresolved greenhouse source is unknown and is not fetched.
+    return JobListing(title=title, company_name=company, source="lever",
                       application_url=f"https://acme.com/jobs/{job_id}", source_job_id=job_id)
 
 

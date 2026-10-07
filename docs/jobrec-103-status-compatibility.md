@@ -61,8 +61,11 @@ one registry file. Lever and Workday stay on the existing page check.
 
 Roblox is configured only in `job_sources_demo.json` (`id` `roblox`,
 `company_name` `Roblox`). The default status check loads both registries, so
-the issue's demo scrape can be confirmed without a new flag. Companies whose
-two files disagree are left on the page check.
+the issue's demo scrape can be confirmed without a new flag. A `greenhouse`
+listing whose company has no slug, two slugs, or a slug that is not safe is
+unknown. Its application page is not requested and pruning does not delete it.
+Companies whose two files disagree are in that case. Other scrapers are
+unchanged.
 
 ## Status
 
@@ -72,9 +75,12 @@ two files disagree are left on the page check.
 | HTTP 404 `{"status": 404, "error": "Job not found"}` and the board record's `name` matches that company | CLOSED | may delete, subject to the existing guards |
 | Same 404 body but the board probe is missing, named for someone else, malformed, redirected, or failed | UNKNOWN | keep |
 | HTTP 200 whose `id` or `company_name` is a different job | UNKNOWN | keep |
+| Redirect on the API host to a different board or job id, or a malformed redirect | UNKNOWN, and that URL is not requested | keep |
 | HTML page, truncated body, timeout, 408/429/5xx, other statuses, non-decimal id | UNKNOWN | keep |
+| Observation finished at or after the listing budget, including a cached board used that late | UNKNOWN | keep |
 | Listing reported by the latest scrape | not requested | keep |
-| Company absent from the registry | existing page check | unchanged |
+| `source` is `greenhouse` and the board is absent, ambiguous, or not a safe slug | UNKNOWN, page not requested | keep |
+| Any other scraper, including a page 404 | existing page check | unchanged |
 
 An open record is OPEN even if it contains `application_deadline`. Absence from
 a scrape is still not closure. Dry-run remains the default. Unknown results are
@@ -88,16 +94,46 @@ A 404 alone is the old checker's CLOSED signal. It is not enough here.
 
 ## Bounds
 
-Per listing: at most 4 HTTP requests, 2 redirects, 200000 response bytes, and
-12 seconds. Each request uses at most 8 seconds. Redirects must stay on
-`https://boards-api.greenhouse.io`. A time or request limit is not cached as a
-fact about the board. A completed board answer is reused for that board and
+Per listing: at most 4 HTTP requests, 2 redirects, and 200000 response bytes.
+The listing budget is 12 seconds on the clock passed into the check
+(`time.monotonic` in the CLI). A `requests` timeout is only an idle/connect
+timeout, at most 8 seconds, and is not that budget.
+
+On the main thread each exchange is armed with `ITIMER_REAL` for the seconds
+still left. Incoming bytes do not refresh that timer. A blocked read is
+interrupted, and so is a body that keeps arriving. The SIGALRM
+handler and any pending interval timer are put back afterward, including when
+the deadline fires. The status is decided only if that clock is still inside
+the budget after the body has been read. A cached board is consulted only
+inside the budget. A late result is unknown and is not stored as a fact about
+the board. A completed in-budget board answer is reused for that board and
 company for the rest of the run.
+
+Where `ITIMER_REAL` cannot be armed (this thread is not the main thread, or
+the platform has no `setitimer`), the check returns unknown and does not
+request. It does not claim a 12 second bound it cannot enforce. The page
+checker used for other scrapers still has only its `requests` timeout. That
+timeout is not a total streaming deadline, and this patch does not describe it
+as one.
+
+A redirect is requested only when it is `https://boards-api.greenhouse.io`
+(port 443 or omitted, no userinfo) and its path is the same board token and,
+for a job request, the same job id. A query may be added. A different path is
+not requested. A redirect URL whose port or host cannot be read is unknown,
+and the response is closed.
+
+The page checker treats `error=true` as Greenhouse closure only for the host
+`greenhouse.io` or a subdomain of it, and only when `error` is a real query
+parameter. A redirected 404 or 410 whose final URL no longer contains the
+stored job id is unknown. A direct 404 or 410 is still closed.
 
 The existing per-host pause, three-failure skip, and mass-closure guard are
 unchanged and still key off the application host.
 
 ## Live GETs on 2026-10-07
+
+Prior observations from the original check. They were not repeated for the
+redirect, deadline, or registry repair.
 
 No login, application, or paid call.
 

@@ -10,7 +10,7 @@ import logging
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import requests
 
@@ -75,6 +75,20 @@ def _read_start(response, max_bytes: int) -> str:
     return b"".join(chunks).decode(response.encoding or "utf-8", errors="replace")
 
 
+def _greenhouse_host(hostname: Optional[str]) -> bool:
+    """True for greenhouse.io and its real subdomains, not a lookalike suffix."""
+    host = (hostname or "").rstrip(".").lower()
+    return host == "greenhouse.io" or host.endswith(".greenhouse.io")
+
+
+def _error_true_parameter(query: str) -> bool:
+    """True when the query has an ``error`` parameter whose value is ``true``.
+
+    ``noterror=true`` is a different parameter. A substring of the raw query is not.
+    """
+    return any(value == "true" for value in parse_qs(query).get("error", ()))
+
+
 def check_link(
     url: str,
     session,
@@ -99,18 +113,19 @@ def check_link(
     try:
         status = response.status_code
         final_url = response.url or url
+        redirected = bool(response.history) or final_url != url
+        if redirected:
+            parts = urlsplit(final_url)
+            # Greenhouse sends a closed job to the company's own board with error=true.
+            if _greenhouse_host(parts.hostname) and _error_true_parameter(parts.query):
+                return LinkResult(LinkStatus.CLOSED, "redirected to the board with error=true", status, final_url)
+            # A redirect that drops the job id is not evidence, including a 404 of that other page.
+            if job_id and job_id not in final_url:
+                return LinkResult(LinkStatus.UNKNOWN, "redirected to a page that no longer names the job", status, final_url)
         if status in _GONE_STATUSES:
             return LinkResult(LinkStatus.CLOSED, f"HTTP {status}", status, final_url)
         if status != 200:
             return LinkResult(LinkStatus.UNKNOWN, f"HTTP {status}", status, final_url)
-
-        if response.history or final_url != url:
-            parts = urlsplit(final_url)
-            # Greenhouse sends a closed job to the company's board with error=true.
-            if (parts.hostname or "").endswith("greenhouse.io") and "error=true" in parts.query:
-                return LinkResult(LinkStatus.CLOSED, "redirected to the board with error=true", status, final_url)
-            if job_id and job_id not in final_url:
-                return LinkResult(LinkStatus.UNKNOWN, "redirected to a page that no longer names the job", status, final_url)
 
         try:
             raw = _read_start(response, max_bytes)

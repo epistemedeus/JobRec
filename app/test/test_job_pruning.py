@@ -42,10 +42,12 @@ def url(job_id: str, host: str = "acme.com") -> str:
 
 
 def make_listing(job_id: str, host: str = "acme.com", company: str = "Acme", **overrides) -> JobListing:
+    # Page-check fixtures are not greenhouse. An unresolved greenhouse source
+    # is unknown and is not fetched, so these controls would stop reaching the page.
     fields = {
         "title": "Software Engineer",
         "company_name": company,
-        "source": "greenhouse",
+        "source": "lever",
         "application_url": url(job_id, host),
         "source_job_id": job_id,
     }
@@ -298,7 +300,7 @@ def stale_now():
 
 
 def configured_listing(job_id: str, company: str, **overrides) -> JobListing:
-    fields = {"application_url": careers(job_id)}
+    fields = {"application_url": careers(job_id), "source": "greenhouse"}
     fields.update(overrides)
     return make_listing(job_id, company=company, **fields)
 

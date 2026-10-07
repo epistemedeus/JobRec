@@ -8,7 +8,8 @@ title or company. The requirement is at least 95%.
 
 A Greenhouse listing whose company matches exactly one configured board is
 confirmed through that board's per-job API instead of its application page.
-An unknown result is not counted as a live page.
+A Greenhouse listing with no single configured board is unknown and its page
+is not requested. An unknown result is not counted as a live page.
 """
 
 import argparse
