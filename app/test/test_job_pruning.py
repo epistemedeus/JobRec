@@ -18,7 +18,8 @@ from db import Base  # noqa: E402
 from job_listing import JobListing  # noqa: E402
 from job_pruning import PruneResult, find_prune_candidates, prune_closed_listings  # noqa: E402
 from job_store import JobListingTable, count_listings, list_listings, upsert_listings  # noqa: E402
-from link_fakes import FakeSession, page  # noqa: E402
+from link_check import LinkStatus, check_link  # noqa: E402
+from link_fakes import FakeSession, json_page, page  # noqa: E402
 import prune_jobs  # noqa: E402
 
 T1 = datetime(2026, 10, 1, 10, 0, tzinfo=timezone.utc)
@@ -254,6 +255,260 @@ def test_cli_defaults_to_dry_run(engine, capsys):
     assert code == 0
     assert count_listings(engine) == 9
     assert "dry run" in capsys.readouterr().out.lower()
+
+
+# --- configured Greenhouse board ---
+
+API = "https://boards-api.greenhouse.io"
+
+
+class Board:
+    def __init__(self, scraper, board_id, company_name):
+        self.scraper = scraper
+        self.id = board_id
+        self.company_name = company_name
+
+
+def careers(job_id: str) -> str:
+    return f"https://careers.roblox.com/jobs/{job_id}?gh_jid={job_id}"
+
+
+def job_api(token: str, job_id: str) -> str:
+    return f"{API}/v1/boards/{token}/jobs/{job_id}"
+
+
+def board_api(token: str) -> str:
+    return f"{API}/v1/boards/{token}"
+
+
+NOT_FOUND = {"status": 404, "error": "Job not found"}
+
+
+def record(job_id: str, company: str, title: str = "Software Engineer") -> dict:
+    return {
+        "id": int(job_id),
+        "title": title,
+        "company_name": company,
+        "absolute_url": careers(job_id),
+    }
+
+
+def stale_now():
+    return T1 + timedelta(days=8)
+
+
+def configured_listing(job_id: str, company: str, **overrides) -> JobListing:
+    fields = {"application_url": careers(job_id)}
+    fields.update(overrides)
+    return make_listing(job_id, company=company, **fields)
+
+
+# A page 404 is closed, and the same is true of any HTTP 404 the old checker sees.
+# The Greenhouse API uses that same job-not-found body when the board token is unknown,
+# so the new path keeps the listing until the board record names the configured company.
+def test_seeded_404_is_closed_on_the_old_path_and_unknown_for_an_unverified_board(engine):
+    application = careers("8143982")
+    job = job_api("wrong-board", "8143982")
+    not_found = json_page(404, NOT_FOUND)
+
+    assert check_link(application, FakeSession({application: page(404, "Not found")}), job_id="8143982").status is LinkStatus.CLOSED
+    assert check_link(job, FakeSession({job: not_found})).status is LinkStatus.CLOSED
+
+    upsert_listings(engine, [configured_listing("8143982", "Roblox")], now=T1)
+    session = FakeSession({
+        job: json_page(404, NOT_FOUND),
+        board_api("wrong-board"): json_page(404, {"status": 404, "error": "Job board not found"}),
+    })
+
+    result = prune_closed_listings(
+        engine, session, dry_run=False, now=stale_now(), sleep=no_sleep,
+        sources=[Board("greenhouse", "wrong-board", "Roblox")],
+    )
+
+    assert result.removed == 0 and result.closed == 0 and result.unknown == 1
+    assert stored_ids(engine) == ["8143982"]
+    assert application not in session.calls
+    assert job in session.calls and board_api("wrong-board") in session.calls
+
+
+# A 200 record for a different post id is not evidence about the stored id
+def test_unrelated_greenhouse_id_is_kept(engine):
+    job = job_api("roblox", "8143982")
+    upsert_listings(engine, [configured_listing("8143982", "Roblox")], now=T1)
+    session = FakeSession({job: json_page(200, record("999", "Roblox", title="Other role"))})
+
+    result = prune_closed_listings(
+        engine, session, dry_run=False, now=stale_now(), sleep=no_sleep,
+        sources=[Board("greenhouse", "roblox", "Roblox")],
+    )
+
+    assert result.removed == 0 and result.unknown == 1 and result.closed == 0
+    assert stored_ids(engine) == ["8143982"]
+    assert session.calls == [job]
+
+
+# The board exists, but its name is a different company, so a job 404 does not delete
+def test_board_named_for_a_different_company_is_kept(engine):
+    job = job_api("other", "8143982")
+    upsert_listings(engine, [configured_listing("8143982", "Roblox")], now=T1)
+    session = FakeSession({
+        job: json_page(404, NOT_FOUND),
+        board_api("other"): json_page(200, {"name": "Other Org", "content": "<p>ok</p>"}),
+    })
+
+    result = prune_closed_listings(
+        engine, session, dry_run=False, now=stale_now(), sleep=no_sleep,
+        sources=[Board("greenhouse", "other", "Roblox")],
+    )
+
+    assert result.removed == 0 and result.unknown == 1
+    assert stored_ids(engine) == ["8143982"]
+
+
+# Once the board record names the company, a job-not-found removes the listing
+def test_verified_board_job_not_found_is_removed_and_probed_once(engine):
+    sources = [Board("greenhouse", "roblox", "Roblox")]
+    listings = [configured_listing(job_id, "Roblox") for job_id in ("8143982", "8143983")]
+    upsert_listings(engine, listings, now=T1)
+    session = FakeSession({
+        job_api("roblox", "8143982"): json_page(404, NOT_FOUND),
+        job_api("roblox", "8143983"): json_page(404, NOT_FOUND),
+        board_api("roblox"): json_page(200, {"name": "Roblox", "content": "<p>careers</p>"}),
+    })
+
+    result = prune_closed_listings(engine, session, dry_run=False, now=stale_now(), sleep=no_sleep, sources=sources)
+
+    assert result == PruneResult(checked=2, closed=2, removed=2, kept=0, unknown=0)
+    assert stored_ids(engine) == []
+    assert session.calls.count(board_api("roblox")) == 1
+
+
+# The default dry run still deletes nothing when the API says the job is gone
+def test_dry_run_keeps_a_verified_closed_greenhouse_job(engine):
+    upsert_listings(engine, [configured_listing("8143982", "Roblox")], now=T1)
+    session = FakeSession({
+        job_api("roblox", "8143982"): json_page(404, NOT_FOUND),
+        board_api("roblox"): json_page(200, {"name": "Roblox", "content": "<p>careers</p>"}),
+    })
+
+    result = prune_closed_listings(
+        engine, session, now=stale_now(), sleep=no_sleep, sources=[Board("greenhouse", "roblox", "Roblox")],
+    )
+
+    assert result.closed == 1 and result.removed == 0
+    assert stored_ids(engine) == ["8143982"]
+
+
+# An exact record is open and the careers page is not requested
+def test_exact_greenhouse_record_is_kept_without_requesting_the_careers_page(engine):
+    application = careers("8143982")
+    job = job_api("roblox", "8143982")
+    upsert_listings(engine, [configured_listing("8143982", "Roblox")], now=T1)
+    session = FakeSession({job: json_page(200, record("8143982", "Roblox", title="[2027] Associate Product Designer, Early Career"))})
+
+    result = prune_closed_listings(
+        engine, session, dry_run=False, now=stale_now(), sleep=no_sleep,
+        sources=[Board("greenhouse", "roblox", "Roblox")],
+    )
+
+    assert result.kept == 1 and result.removed == 0 and result.unknown == 0
+    assert session.calls == [job]
+    assert application not in session.calls
+    assert stored_ids(engine) == ["8143982"]
+
+
+# The host string in the application URL does not choose a board
+def test_roblox_in_the_url_does_not_select_the_roblox_board(engine):
+    application = careers("5")
+    upsert_listings(engine, [make_listing("5", company="Acme", application_url=application)], now=T1)
+    session = FakeSession({application: page(404, "Not found")})
+
+    result = prune_closed_listings(
+        engine, session, dry_run=False, now=stale_now(), sleep=no_sleep,
+        sources=[Board("greenhouse", "roblox", "Roblox")],
+    )
+
+    assert result.removed == 1
+    assert session.calls == [application]
+
+
+# A listing the latest scrape still reported is not sent to the API
+def test_latest_scrape_skips_a_configured_greenhouse_listing(engine):
+    upsert_listings(engine, [configured_listing("8143982", "Roblox")], now=T2)
+    session = FakeSession({})
+
+    result = prune_closed_listings(
+        engine, session, dry_run=False, now=T2, sleep=no_sleep,
+        sources=[Board("greenhouse", "roblox", "Roblox")],
+    )
+
+    assert result == PruneResult()
+    assert session.calls == []
+
+
+# Timeouts, rate limits, server errors, pages, and a non-decimal id do not delete
+def test_failed_malformed_and_page_responses_keep_configured_listings(engine):
+    sources = [
+        Board("greenhouse", "roblox", "Roblox"),
+        Board("greenhouse", "figma", "Figma"),
+        Board("greenhouse", "cloudflare", "Cloudflare"),
+        Board("greenhouse", "reddit", "Reddit"),
+        Board("greenhouse", "duolingo", "Duolingo"),
+    ]
+    listings = [
+        configured_listing("11", "Roblox", application_url="https://careers.roblox.com/jobs/11"),
+        configured_listing("12", "Figma", application_url="https://figma.example/jobs/12"),
+        configured_listing("13", "Cloudflare", application_url="https://cloudflare.example/jobs/13"),
+        configured_listing("14", "Reddit", application_url="https://reddit.example/jobs/14"),
+        configured_listing("15", "Duolingo", application_url="https://duolingo.example/jobs/15", source_job_id="nope"),
+    ]
+    upsert_listings(engine, listings, now=T1)
+    session = FakeSession({
+        job_api("roblox", "11"): requests.Timeout("timed out"),
+        job_api("figma", "12"): json_page(429, {"status": 429}),
+        job_api("cloudflare", "13"): json_page(500, {"status": 500, "error": "unavailable"}),
+        job_api("reddit", "14"): page(200, "<html><body>Success</body></html>", headers={"Content-Type": "text/html"}),
+    })
+
+    result = prune_closed_listings(engine, session, dry_run=False, now=stale_now(), sleep=no_sleep, sources=sources)
+
+    assert result.removed == 0 and result.unknown == 5 and result.closed == 0
+    assert count_listings(engine) == 5
+    assert board_api("roblox") not in session.calls
+    assert "https://duolingo.example/jobs/15" not in session.calls
+
+
+# A redirect off the API host is unknown and that host is not requested
+def test_redirect_to_a_different_host_keeps_the_listing(engine):
+    job = job_api("roblox", "8143982")
+    upsert_listings(engine, [configured_listing("8143982", "Roblox")], now=T1)
+    session = FakeSession({
+        job: page(302, "", headers={"Location": "https://careers.roblox.com/jobs/8143982?gh_jid=8143982"}),
+    })
+
+    result = prune_closed_listings(
+        engine, session, dry_run=False, now=stale_now(), sleep=no_sleep,
+        sources=[Board("greenhouse", "roblox", "Roblox")],
+    )
+
+    assert result.removed == 0 and result.unknown == 1
+    assert session.calls == [job]
+    assert stored_ids(engine) == ["8143982"]
+
+
+# Lever stays on the page check. A Roblox-shaped URL does not make it a Greenhouse call.
+def test_non_greenhouse_source_keeps_the_page_check(engine):
+    application = careers("85")
+    upsert_listings(engine, [configured_listing("85", "Roblox", source="lever")], now=T1)
+    session = FakeSession({application: page(404, "Not found")})
+
+    result = prune_closed_listings(
+        engine, session, dry_run=False, now=stale_now(), sleep=no_sleep,
+        sources=[Board("greenhouse", "roblox", "Roblox"), Board("lever", "roblox", "Roblox")],
+    )
+
+    assert result.removed == 1
+    assert session.calls == [application]
 
 
 # With --delete the closed listings are removed

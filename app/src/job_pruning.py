@@ -7,8 +7,10 @@ Pruning works in two steps so that it never deletes on a guess:
    the same source and company), or when nothing has reported it for a week.
    Listings the latest scrape did report are known to be open and are not touched.
 2. Confirm. Each candidate's application link is followed (see link_check.py).
-   Only a listing whose link positively shows it is closed is removed. A failed
-   or blocked request leaves the listing in place and is logged.
+   A Greenhouse listing whose company matches exactly one configured board is
+   confirmed through that board's per-job API instead (see greenhouse_status.py).
+   Only a listing whose check positively shows it is closed is removed. A failed
+   or blocked request, or an unverified board, leaves the listing in place and is logged.
 
 Being absent from a scrape is never enough on its own: some scrapers fetch only
 part of a large board, so an absent listing may well still be open.
@@ -27,8 +29,9 @@ from sqlalchemy import Engine, and_, delete, func, or_, select
 from sqlalchemy.orm import Session
 
 from db import Base
+from greenhouse_status import check_configured_link, load_status_sources
 from job_store import JobListingTable, _to_db
-from link_check import LinkStatus, check_link
+from link_check import LinkStatus
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +118,7 @@ def prune_closed_listings(
     sleep: Callable[[float], None] = time.sleep,
     pause: float = DEFAULT_PAUSE,
     rng: Optional[random.Random] = None,
+    sources=None,
 ) -> PruneResult:
     """Check candidate listings' links and remove the ones that are closed.
 
@@ -123,6 +127,8 @@ def prune_closed_listings(
     limited runs do not keep checking the same ones.
     """
     session = session or requests.Session()
+    registry = load_status_sources() if sources is None else list(sources)
+    board_cache: dict = {}
     candidates = find_prune_candidates(engine, now=now, stale_after=stale_after)
     if limit is not None:
         (rng or random.Random()).shuffle(candidates)
@@ -141,7 +147,16 @@ def prune_closed_listings(
         if checked_by_host.get(host):
             sleep(pause)
 
-        link = check_link(candidate.application_url, session, job_id=candidate.source_job_id)
+        link = check_configured_link(
+            candidate.application_url,
+            session,
+            source=candidate.source,
+            source_job_id=candidate.source_job_id,
+            company_name=candidate.company_name,
+            sources=registry,
+            board_cache=board_cache,
+            job_id=candidate.source_job_id,
+        )
         result.checked += 1
         checked_by_host[host] = checked_by_host.get(host, 0) + 1
 

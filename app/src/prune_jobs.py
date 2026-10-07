@@ -1,6 +1,6 @@
 """Remove stored job listings that are no longer open.
 
-Run from app/src:  python prune_jobs.py [--delete] [--limit N]
+Run from app/src:  python prune_jobs.py [--delete] [--limit N] [--sources registry.json]
 
 Without --delete this is a dry run: it follows the links of the candidate
 listings and reports how many look closed, but removes nothing. Uses the same
@@ -12,6 +12,7 @@ import logging
 import sys
 import time
 from os import environ as env
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -23,6 +24,7 @@ def main(argv=None, *, engine=None, session=None, now=None, sleep=time.sleep) ->
     parser = argparse.ArgumentParser(description="Remove stored job listings whose application link shows they are closed.")
     parser.add_argument("--delete", action="store_true", help="actually remove closed listings (default is a dry run)")
     parser.add_argument("--limit", type=int, default=None, help="follow at most this many links")
+    parser.add_argument("--sources", type=Path, default=None, help="registry file to read; default uses the checked-in registries")
     args = parser.parse_args(argv)
 
     if engine is None:
@@ -31,7 +33,13 @@ def main(argv=None, *, engine=None, session=None, now=None, sleep=time.sleep) ->
         engine = make_engine(env.get("DATABASE_URL", "sqlite+pysqlite:///user_skills.db"))
         Base.metadata.create_all(engine)
 
-    result = prune_closed_listings(engine, session, dry_run=not args.delete, limit=args.limit, now=now, sleep=sleep)
+    sources = None
+    if args.sources is not None:
+        from job_sources import load_sources
+        sources = load_sources(args.sources)
+    result = prune_closed_listings(
+        engine, session, dry_run=not args.delete, limit=args.limit, now=now, sleep=sleep, sources=sources,
+    )
     if args.delete:
         print(f"Checked {result.checked} links: removed {result.removed} closed listings, "
               f"{result.kept} still open, {result.unknown} undetermined (kept).")
