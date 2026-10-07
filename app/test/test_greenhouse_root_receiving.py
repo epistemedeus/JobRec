@@ -4,7 +4,7 @@ import sys
 SRC_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src"))
 sys.path.insert(0, SRC_DIR)
 from greenhouse_status import check_configured_link, check_greenhouse_job
-from link_check import LinkStatus
+from link_check import LinkStatus, check_link
 from link_fakes import FakeSession, json_page, page
 
 API = "https://boards-api.greenhouse.io"
@@ -78,3 +78,24 @@ def test_malformed_redirect_port_is_unknown_not_an_exception():
     result = check_greenhouse_job("roblox", "8143982", "Roblox", session)
     assert result.status is LinkStatus.UNKNOWN
     assert response.closed
+
+def test_legacy_greenhouse_host_suffix_is_not_board_authority():
+    original = "https://careers.example.test/jobs/8143982"
+    landed = "https://notgreenhouse.io/company?error=true"
+    session = FakeSession({original: page(200, "Careers", url=landed, redirected=True)})
+    result = check_link(original, session, job_id="8143982")
+    assert result.status is LinkStatus.UNKNOWN
+
+def test_legacy_substring_query_is_not_error_parameter():
+    original = "https://boards.greenhouse.io/roblox/jobs/8143982"
+    landed = "https://boards.greenhouse.io/roblox?noterror=true"
+    session = FakeSession({original: page(200, "Careers", url=landed, redirected=True)})
+    result = check_link(original, session, job_id="8143982")
+    assert result.status is LinkStatus.UNKNOWN
+
+def test_legacy_redirected404_without_job_identity_is_not_closure():
+    original = "https://careers.example.test/jobs/8143982"
+    landed = "https://careers.example.test/"
+    session = FakeSession({original: page(404, "Missing careers page", url=landed, redirected=True)})
+    result = check_link(original, session, job_id="8143982")
+    assert result.status is LinkStatus.UNKNOWN
